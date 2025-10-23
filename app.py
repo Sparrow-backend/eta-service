@@ -4,18 +4,17 @@ import logging
 from typing import Dict, Any
 import numpy as np
 import pandas as pd
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from contextlib import asynccontextmanager
+import subprocess
+import sys
+import tempfile
+import shutil
 from src.entity.config_entity import DataTransformationConfig, TrainingPipelineConfig
-from src.components.data_ingestion import DataIngestion
-from src.components.data_validation import DataValidation
-from src.components.data_transformation import DataTransformation
-from src.components.model_trainer import ModelTrainer
-from src.components.model_evaluation import ModelEvaluation
-from src.components.model_pusher import ModelPusher
 from glob import glob
 
 # Configure logging
@@ -74,11 +73,13 @@ def find_latest_artifacts():
         return None, None
 
 # Try to use config first, fall back to finding latest artifacts
+PIPELINE_PATH = None
+MODEL_PATH = "final_model/model.pkl"
+
 try:
     training_pipeline_config = TrainingPipelineConfig()
     data_transformation_config = DataTransformationConfig(training_pipeline_config)
     PIPELINE_PATH = data_transformation_config.transformed_object_file_path
-    MODEL_PATH = "final_model/model.pkl"
     
     # Check if the config path exists
     if not os.path.exists(PIPELINE_PATH):
@@ -93,7 +94,6 @@ except Exception as e:
     logger.warning(f"Could not load config: {e}")
     logger.info("Attempting to find latest artifacts...")
     PIPELINE_PATH, _ = find_latest_artifacts()
-    MODEL_PATH = "final_model/model.pkl"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -157,6 +157,7 @@ class TrainingResponse(BaseModel):
     message: str
     model_version: str
     training_duration: float
+    artifacts_path: str
 
 # Input schema with ORIGINAL feature names
 class DeliveryInput(BaseModel):
@@ -230,95 +231,159 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     training_required: bool
 
-# Training endpoint
+def run_training_pipeline():
+    """Run the training pipeline by executing main.py"""
+    start_time = datetime.now()
+    
+    # Create a temporary directory for the training process
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            # Set the current working directory to where main.py is located
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            main_script = os.path.join(script_dir, "main.py")
+            
+            if not os.path.exists(main_script):
+                raise FileNotFoundError(f"main.py not found at {main_script}")
+            
+            logger.info(f"Starting training pipeline from {main_script}")
+            
+            # Run main.py using subprocess
+            # Capture output and errors
+            process = subprocess.Popen(
+                [sys.executable, main_script],
+                cwd=script_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            # Read output in real-time
+            stdout_output = []
+            stderr_output = []
+            
+            while True:
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    line = output.strip()
+                    logger.info(f"TRAINING: {line}")
+                    stdout_output.append(line)
+            
+            # Wait for process to complete and capture any remaining stderr
+            return_code = process.wait()
+            
+            # Read remaining stderr
+            stderr_lines = process.stderr.readlines()
+            if stderr_lines:
+                for line in stderr_lines:
+                    line = line.strip()
+                    if line:
+                        logger.error(f"TRAINING ERROR: {line}")
+                        stderr_output.append(line)
+            
+            if return_code != 0:
+                error_msg = f"Training pipeline failed with return code {return_code}\n"
+                if stderr_output:
+                    error_msg += "STDERR:\n" + "\n".join(stderr_output) + "\n"
+                if stdout_output:
+                    error_msg += "STDOUT:\n" + "\n".join(stdout_output)
+                raise subprocess.CalledProcessError(return_code, [sys.executable, main_script], stderr="\n".join(stderr_output))
+            
+            logger.info("Training pipeline completed successfully")
+            end_time = datetime.now()
+            training_duration = (end_time - start_time).total_seconds()
+            
+            return training_duration, end_time
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Training pipeline subprocess failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Training pipeline execution failed: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error running training pipeline: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Training pipeline error: {str(e)}")
+
+# Training endpoint that triggers your main.py pipeline
 @app.post("/train", response_model=TrainingResponse, tags=["Training"])
 def train_model(request: TrainingRequest):
-    """Trigger model training and load the model for inference"""
-    global model_artifacts, is_model_trained
+    """Trigger model training by running the main.py training pipeline"""
+    global model_artifacts, is_model_trained, PIPELINE_PATH, MODEL_PATH
     
     if is_model_trained and not request.force_retrain:
+        # Find the latest artifacts to provide path info
+        current_pipeline, _ = find_latest_artifacts()
+        current_model_path = MODEL_PATH
+        
         return TrainingResponse(
             status="skipped",
             message="Model already trained. Use force_retrain=True to retrain.",
             model_version="1.0.0",
-            training_duration=0.0
+            training_duration=0.0,
+            artifacts_path=os.path.dirname(current_pipeline) if current_pipeline else current_model_path
         )
     
-    start_time = pd.Timestamp.now()
+    start_time = datetime.now()
     
     try:
-        logger.info("Starting model training...")
+        logger.info("Starting model training pipeline...")
         
-        # Initialize training pipeline
-        training_pipeline_config = TrainingPipelineConfig()
+        # Run your actual training pipeline
+        training_duration, pipeline_end_time = run_training_pipeline()
         
-        # Execute complete training pipeline
-        logger.info("Step 1: Data Ingestion")
-        data_ingestion = DataIngestion(training_pipeline_config)
-        train_data_path, test_data_path = data_ingestion.initiate_data_ingestion()
+        # After training, find and load the new artifacts
+        logger.info("Loading newly trained model artifacts...")
         
-        logger.info("Step 2: Data Validation")
-        data_validation = DataValidation(train_data_path, training_pipeline_config)
-        status = data_validation.initiate_data_validation()
+        # Find the latest artifacts created by the training pipeline
+        new_pipeline_path, _ = find_latest_artifacts()
         
-        logger.info("Step 3: Data Transformation")
-        data_transformation = DataTransformation(
-            train_data_path=train_data_path,
-            test_data_path=test_data_path,
-            training_pipeline_config=training_pipeline_config
-        )
-        train_arr, test_arr, preprocessor_obj = data_transformation.initiate_data_transformation()
+        if not new_pipeline_path:
+            # Fallback to config path
+            try:
+                training_pipeline_config = TrainingPipelineConfig()
+                data_transformation_config = DataTransformationConfig(training_pipeline_config)
+                new_pipeline_path = data_transformation_config.transformed_object_file_path
+            except:
+                raise HTTPException(status_code=500, detail="Could not locate trained model artifacts")
         
-        logger.info("Step 4: Model Training")
-        model_trainer = ModelTrainer(
-            model_data=train_arr,
-            preprocess_object=preprocessor_obj,
-            training_pipeline_config=training_pipeline_config
-        )
-        trained_model = model_trainer.initiate_model_trainer()
+        # Check if model file exists
+        if not os.path.exists(MODEL_PATH):
+            raise HTTPException(status_code=500, detail=f"Trained model not found at {MODEL_PATH}")
         
-        logger.info("Step 5: Model Evaluation")
-        model_evaluation = ModelEvaluation(
-            model=trained_model,
-            X_train=train_arr[:, :-1],
-            X_test=test_arr[:, :-1],
-            y_train=train_arr[:, -1],
-            y_test=test_arr[:, -1],
-            training_pipeline_config=training_pipeline_config
-        )
-        model_score, model_accuracy_score = model_evaluation.initiate_model_evaluation()
-        
-        logger.info("Step 6: Model Pushing")
-        model_pusher = ModelPusher(
-            model=trained_model,
-            preprocess_object=preprocessor_obj,
-            model_evaluation=model_evaluation,
-            training_pipeline_config=training_pipeline_config
-        )
-        model_pusher.initiate_model_pusher()
-        
-        # Load the newly trained model into memory
-        end_time = pd.Timestamp.now()
-        training_duration = (end_time - start_time).total_seconds()
-        
-        # Update paths to new artifacts
-        data_transformation_config = DataTransformationConfig(training_pipeline_config)
-        PIPELINE_PATH = data_transformation_config.transformed_object_file_path
+        # Update global paths
+        PIPELINE_PATH = new_pipeline_path
         MODEL_PATH = "final_model/model.pkl"
         
+        # Load the pipeline and model into memory
         model_artifacts['pipeline'] = joblib.load(PIPELINE_PATH)
         model_artifacts['model'] = joblib.load(MODEL_PATH)
         is_model_trained = True
         
-        logger.info(f"Model training completed successfully in {training_duration:.2f} seconds")
+        # Get artifacts path for response
+        artifacts_base = os.path.dirname(PIPELINE_PATH)
+        artifacts_path = os.path.dirname(artifacts_base)
+        
+        total_duration = (datetime.now() - start_time).total_seconds()
+        
+        logger.info(f"Model training and loading completed successfully in {total_duration:.2f} seconds")
+        logger.info(f"Pipeline loaded from: {PIPELINE_PATH}")
+        logger.info(f"Model loaded from: {MODEL_PATH}")
         
         return TrainingResponse(
             status="success",
             message="Model trained and loaded successfully",
             model_version="1.0.0",
-            training_duration=training_duration
+            training_duration=total_duration,
+            artifacts_path=artifacts_path
         )
         
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Training pipeline subprocess failed with code {e.returncode}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Training pipeline failed with exit code {e.returncode}. Check logs for details."
+        )
     except Exception as e:
         logger.error(f"Training failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
@@ -412,7 +477,9 @@ def get_model_info():
     return {
         "model_version": "1.0.0",
         "model_type": type(model_artifacts['model']).__name__,
-        "pipeline_type": type(model_artifacts['pipeline']).__name__
+        "pipeline_type": type(model_artifacts['pipeline']).__name__,
+        "pipeline_path": PIPELINE_PATH,
+        "model_path": MODEL_PATH
     }
 
 if __name__ == "__main__":
