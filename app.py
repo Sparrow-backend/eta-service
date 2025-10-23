@@ -1,19 +1,14 @@
 import os
 import joblib
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, status, UploadFile, File
+from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from contextlib import asynccontextmanager
-import tempfile
-import shutil
-from datetime import datetime
-import zipfile
-
 from src.entity.config_entity import DataTransformationConfig, TrainingPipelineConfig
 from src.components.data_ingestion import DataIngestion
 from src.components.data_validation import DataValidation
@@ -33,7 +28,6 @@ logger = logging.getLogger(__name__)
 # Global variables for model artifacts and training status
 model_artifacts = {}
 is_model_trained = False
-training_lock = False  # Prevent concurrent training
 
 def find_latest_artifacts():
     """Find the most recent artifacts directory"""
@@ -41,45 +35,63 @@ def find_latest_artifacts():
         artifacts_base = "Artifacts"
         if not os.path.exists(artifacts_base):
             return None, None
+        
+        # Get all artifact directories sorted by timestamp (most recent first)
         artifact_dirs = sorted(
             [d for d in os.listdir(artifacts_base) if os.path.isdir(os.path.join(artifacts_base, d))],
             reverse=True
         )
+        
         if not artifact_dirs:
             return None, None
+        
         latest_dir = artifact_dirs[0]
         logger.info(f"Found latest artifacts directory: {latest_dir}")
+        
+        # Look for the pipeline file (try common names)
         pipeline_dir = os.path.join(artifacts_base, latest_dir, "data_transformation", "transformed_object")
+        
         if os.path.exists(pipeline_dir):
+            # Try to find the pipeline file with various possible names
             possible_names = ["preprocessing.pkl", "preprocessor.pkl", "pipeline.pkl", "transformed_object.pkl"]
+            
             for name in possible_names:
                 pipeline_path = os.path.join(pipeline_dir, name)
                 if os.path.exists(pipeline_path):
                     logger.info(f"Found pipeline at: {pipeline_path}")
                     return pipeline_path, None
+            
+            # If no standard name found, get any .pkl file
             pkl_files = glob(os.path.join(pipeline_dir, "*.pkl"))
             if pkl_files:
                 logger.info(f"Found pipeline file: {pkl_files[0]}")
                 return pkl_files[0], None
+        
         return None, None
+        
     except Exception as e:
         logger.error(f"Error finding artifacts: {e}")
         return None, None
 
-# Try to initialize config and find existing artifacts
+# Try to use config first, fall back to finding latest artifacts
 try:
     training_pipeline_config = TrainingPipelineConfig()
     data_transformation_config = DataTransformationConfig(training_pipeline_config)
     PIPELINE_PATH = data_transformation_config.transformed_object_file_path
     MODEL_PATH = "final_model/model.pkl"
+    
+    # Check if the config path exists
     if not os.path.exists(PIPELINE_PATH):
         logger.warning(f"Config path not found: {PIPELINE_PATH}")
+        logger.info("Attempting to find latest artifacts...")
         found_pipeline, _ = find_latest_artifacts()
         if found_pipeline:
             PIPELINE_PATH = found_pipeline
             logger.info(f"Using found pipeline: {PIPELINE_PATH}")
+        
 except Exception as e:
     logger.warning(f"Could not load config: {e}")
+    logger.info("Attempting to find latest artifacts...")
     PIPELINE_PATH, _ = find_latest_artifacts()
     MODEL_PATH = "final_model/model.pkl"
 
@@ -96,17 +108,21 @@ async def lifespan(app: FastAPI):
             logger.info("Loading existing model artifacts...")
             logger.info(f"Pipeline path: {PIPELINE_PATH}")
             logger.info(f"Model path: {MODEL_PATH}")
-            
+
+            # Load the complete preprocessing pipeline
             model_artifacts['pipeline'] = joblib.load(PIPELINE_PATH)
+            
+            # Load the trained model
             model_artifacts['model'] = joblib.load(MODEL_PATH)
+
             is_model_trained = True
-            logger.info("✓ Existing model artifacts loaded successfully")
+            logger.info("✓ Model artifacts loaded successfully")
         else:
             logger.warning("No trained model found. Training will be required.")
             is_model_trained = False
             
     except Exception as e:
-        logger.error(f"Failed to load existing model artifacts: {str(e)}")
+        logger.error(f"Failed to load model artifacts: {str(e)}")
         is_model_trained = False
 
     yield
@@ -119,7 +135,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ETA Prediction API",
     version="1.0.0",
-    description="API for training and predicting delivery time based on various features",
+    description="API for predicting delivery time based on various features",
     lifespan=lifespan
 )
 
@@ -132,18 +148,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Training request models
+# Training request model
 class TrainingRequest(BaseModel):
-    """Request model for triggering training"""
     force_retrain: bool = Field(default=False, description="Force retraining even if model exists")
 
-class TrainingConfig(BaseModel):
-    """Configuration for training process"""
-    test_size: float = Field(0.2, ge=0.1, le=0.4, description="Test split size")
-    random_state: int = Field(42, description="Random state for reproducibility")
-    max_train_samples: Optional[int] = Field(None, description="Max training samples (None for all)")
+class TrainingResponse(BaseModel):
+    status: str
+    message: str
+    model_version: str
+    training_duration: float
 
-# Input schema for prediction
+# Input schema with ORIGINAL feature names
 class DeliveryInput(BaseModel):
     Distance_km: float = Field(..., gt=0, example=10.5, description="Distance in kilometers")
     Courier_Experience_yrs: float = Field(..., ge=0, example=2.0, description="Courier experience in years")
@@ -208,57 +223,28 @@ class PredictionResponse(BaseModel):
     predicted_delivery_time: float
     input_features: Dict[str, Any]
     model_version: str
-    training_timestamp: Optional[str] = None
 
 class HealthResponse(BaseModel):
     status: str
     message: str
     model_loaded: bool
     training_required: bool
-    last_trained: Optional[str] = None
-
-class TrainingResponse(BaseModel):
-    status: str
-    message: str
-    model_version: str
-    training_duration: float
-    model_metrics: Optional[Dict[str, float]] = None
-    artifacts_path: str
 
 # Training endpoint
 @app.post("/train", response_model=TrainingResponse, tags=["Training"])
-async def train_model(request: TrainingRequest, config: TrainingConfig = None):
-    """
-    Train or retrain the ETA prediction model.
+def train_model(request: TrainingRequest):
+    """Trigger model training and load the model for inference"""
+    global model_artifacts, is_model_trained
     
-    This endpoint:
-    1. Validates if training is needed
-    2. Executes the complete ML pipeline
-    3. Loads the newly trained model into memory
-    4. Returns training results and metrics
-    """
-    global model_artifacts, is_model_trained, training_lock
-    
-    if training_lock:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Training is already in progress. Please wait for it to complete."
+    if is_model_trained and not request.force_retrain:
+        return TrainingResponse(
+            status="skipped",
+            message="Model already trained. Use force_retrain=True to retrain.",
+            model_version="1.0.0",
+            training_duration=0.0
         )
     
-    # Check if training is needed
-    if is_model_trained and not request.force_retrain:
-        current_model_path = MODEL_PATH
-        if os.path.exists(current_model_path):
-            return TrainingResponse(
-                status="skipped",
-                message="Model already trained and available. Use force_retrain=True to retrain.",
-                model_version="1.0.0",
-                training_duration=0.0,
-                artifacts_path=current_model_path
-            )
-    
-    training_lock = True
-    start_time = datetime.now()
+    start_time = pd.Timestamp.now()
     
     try:
         logger.info("Starting model training...")
@@ -312,10 +298,10 @@ async def train_model(request: TrainingRequest, config: TrainingConfig = None):
         model_pusher.initiate_model_pusher()
         
         # Load the newly trained model into memory
-        end_time = datetime.now()
+        end_time = pd.Timestamp.now()
         training_duration = (end_time - start_time).total_seconds()
         
-        # Update global paths to new artifacts
+        # Update paths to new artifacts
         data_transformation_config = DataTransformationConfig(training_pipeline_config)
         PIPELINE_PATH = data_transformation_config.transformed_object_file_path
         MODEL_PATH = "final_model/model.pkl"
@@ -326,113 +312,17 @@ async def train_model(request: TrainingRequest, config: TrainingConfig = None):
         
         logger.info(f"Model training completed successfully in {training_duration:.2f} seconds")
         
-        # Get model path for artifacts
-        artifacts_base = os.path.dirname(PIPELINE_PATH)
-        artifacts_path = os.path.dirname(artifacts_base)
-        
         return TrainingResponse(
             status="success",
             message="Model trained and loaded successfully",
-            model_version=f"1.0.{int(datetime.now().timestamp())}",
-            training_duration=training_duration,
-            model_metrics={
-                'r2_score': float(model_score),
-                'accuracy': float(model_accuracy_score) if model_accuracy_score else None,
-                'training_time_seconds': training_duration
-            },
-            artifacts_path=str(artifacts_path)
+            model_version="1.0.0",
+            training_duration=training_duration
         )
         
     except Exception as e:
         logger.error(f"Training failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
-    
-    finally:
-        training_lock = False
 
-# Upload training data endpoint
-@app.post("/train/upload-data", tags=["Training"])
-async def upload_training_data(file: UploadFile = File(..., description="CSV or ZIP file containing training data")):
-    """
-    Upload training data file and trigger training.
-    
-    Supports:
-    - Single CSV files (train_data.csv, test_data.csv, or single dataset)
-    - ZIP files containing multiple CSV files
-    """
-    global training_lock
-    
-    if training_lock:
-        raise HTTPException(
-            status_code=429,
-            detail="Training is already in progress. Please wait."
-        )
-    
-    if not file.filename.endswith(('.csv', '.zip')):
-        raise HTTPException(
-            status_code=400,
-            detail="Only CSV or ZIP files are supported"
-        )
-    
-    temp_dir = None
-    try:
-        # Create temporary directory
-        with tempfile.TemporaryDirectory() as temp_dir:
-            filename = file.filename
-            file_path = os.path.join(temp_dir, filename)
-            
-            # Save uploaded file
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            
-            # Handle ZIP files
-            if filename.endswith('.zip'):
-                with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    zip_ref.extractall(temp_dir)
-                
-                # Find CSV files in extracted content
-                csv_files = [f for f in os.listdir(temp_dir) if f.endswith('.csv')]
-                if not csv_files:
-                    raise HTTPException(status_code=400, detail="No CSV files found in ZIP")
-                
-                # Place CSV files in expected data directory structure
-                data_dir = os.path.join(temp_dir, "data")
-                os.makedirs(data_dir, exist_ok=True)
-                for csv_file in csv_files:
-                    shutil.move(
-                        os.path.join(temp_dir, csv_file),
-                        os.path.join(data_dir, csv_file)
-                    )
-            else:
-                # Handle single CSV file
-                data_dir = os.path.join(temp_dir, "data")
-                os.makedirs(data_dir, exist_ok=True)
-                shutil.move(file_path, os.path.join(data_dir, "train_data.csv"))
-            
-            # Update config to use uploaded data
-            training_pipeline_config = TrainingPipelineConfig()
-            training_pipeline_config.artifact_root = temp_dir
-            
-            # Trigger training with uploaded data
-            training_request = TrainingRequest(force_retrain=True)
-            training_config = TrainingConfig()
-            
-            # Manually call training logic
-            result = await train_model(training_request, training_config)
-            return result
-            
-    except Exception as e:
-        logger.error(f"Data upload and training failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Upload and training failed: {str(e)}")
-    
-    finally:
-        if temp_dir:
-            try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except:
-                pass
-
-# Health check endpoint
 @app.get("/", response_model=HealthResponse, tags=["Health"])
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 def health_check():
@@ -443,29 +333,15 @@ def health_check():
         and model_artifacts['model'] is not None
     )
     
-    training_required = not is_model_trained or not model_loaded
-    
-    # Try to get last trained timestamp
-    last_trained = None
-    if os.path.exists(MODEL_PATH):
-        try:
-            # Get timestamp of model file
-            last_trained = datetime.fromtimestamp(os.path.getmtime(MODEL_PATH)).isoformat()
-        except:
-            pass
-    
     return HealthResponse(
-        status="healthy" if model_loaded else "degraded",
+        status="healthy" if model_loaded else "unhealthy",
         message="ETA Prediction API is running" if model_loaded else "Model not loaded - training required",
         model_loaded=model_loaded,
-        training_required=training_required,
-        last_trained=last_trained
+        training_required=not is_model_trained
     )
 
-# Prediction endpoints
 @app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
 def predict_eta(input_data: DeliveryInput):
-    """Predict ETA using the loaded model"""
     global model_artifacts, is_model_trained
     
     if not is_model_trained or 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
@@ -491,8 +367,7 @@ def predict_eta(input_data: DeliveryInput):
         return PredictionResponse(
             predicted_delivery_time=round(predicted_time, 2),
             input_features=input_dict,
-            model_version="1.0.0",
-            training_timestamp=None  # Could store this in a config file
+            model_version="1.0.0"
         )
 
     except ValueError as ve:
@@ -504,7 +379,6 @@ def predict_eta(input_data: DeliveryInput):
 
 @app.post("/predict/batch", tags=["Prediction"])
 def predict_batch(input_data: list[DeliveryInput]):
-    """Batch prediction endpoint"""
     global model_artifacts, is_model_trained
     
     if not is_model_trained or 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
@@ -528,49 +402,17 @@ def predict_batch(input_data: list[DeliveryInput]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Model information endpoint
 @app.get("/model/info", tags=["Model"])
 def get_model_info():
-    """Get information about the loaded model"""
     global model_artifacts, is_model_trained
     
     if not is_model_trained or 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
         raise HTTPException(status_code=503, detail="Model not trained. Please call /train endpoint first.")
     
-    # Get last trained timestamp
-    last_trained = None
-    if os.path.exists(MODEL_PATH):
-        try:
-            last_trained = datetime.fromtimestamp(os.path.getmtime(MODEL_PATH)).isoformat()
-        except:
-            pass
-    
     return {
         "model_version": "1.0.0",
         "model_type": type(model_artifacts['model']).__name__,
-        "pipeline_type": type(model_artifacts['pipeline']).__name__,
-        "last_trained": last_trained,
-        "status": "ready"
-    }
-
-# Training status endpoint
-@app.get("/training/status", tags=["Training"])
-def get_training_status():
-    """Get current training status"""
-    global training_lock, is_model_trained
-    
-    model_loaded = (
-        'pipeline' in model_artifacts 
-        and model_artifacts['pipeline'] is not None
-        and 'model' in model_artifacts
-        and model_artifacts['model'] is not None
-    )
-    
-    return {
-        "is_trained": is_model_trained,
-        "model_loaded": model_loaded,
-        "training_in_progress": training_lock,
-        "training_required": not is_model_trained or not model_loaded
+        "pipeline_type": type(model_artifacts['pipeline']).__name__
     }
 
 if __name__ == "__main__":
