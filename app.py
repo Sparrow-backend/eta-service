@@ -4,23 +4,29 @@ import logging
 from typing import Dict, Any
 import numpy as np
 import pandas as pd
-from datetime import datetime
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from contextlib import asynccontextmanager
-from src.entity.config_entity import DataTransformationConfig, TrainingPipelineConfig
-from src.entity.config_entity import DataIngestionConfig
-from src.entity.config_entity import DataValidationConfig
-from src.entity.config_entity import ModelTrainerConfig
+from glob import glob
+
+# Training pipeline imports
+from src.exception.exception import DeliveryTimeException
 from src.components.data_ingestion import DataIngestion
+from src.logging.logger import logging as training_logger  # Avoid conflict with main logger
+from src.entity.config_entity import (
+    DataIngestionConfig, 
+    TrainingPipelineConfig,
+    DataValidationConfig,
+    DataTransformationConfig,
+    ModelTrainerConfig
+)
 from src.components.data_validation import DataValidation
 from src.components.data_transformation import DataTransformation
 from src.components.model_trainer import ModelTrainer
-from src.logging.logger import logging
-from glob import glob
-from src.exception.exception import DeliveryTimeException
+
+import sys
 
 # Configure logging
 logging.basicConfig(
@@ -29,12 +35,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variables for model artifacts and training status
+# Global variables for model artifacts
 model_artifacts = {}
-is_model_trained = False
 
-# Auto-training flag - set to False if you want to skip auto-training
-AUTO_TRAIN_ON_STARTUP = True  # Set to False to avoid startup delays
+def run_training_pipeline():
+    """Execute the full ML training pipeline from main.py"""
+    try:
+        logger.info("Starting training pipeline...")
+        trainingPipelineConfig = TrainingPipelineConfig()
+        dataIngestionConfig = DataIngestionConfig(trainingPipelineConfig)
+        data_ingestion = DataIngestion(dataIngestionConfig)
+
+        logger.info("Initiate the data ingestion")
+        dataIngestionArtifact = data_ingestion.initiate_data_ingestion()
+        logger.info("DataIngestion Completed")
+        print(dataIngestionArtifact)
+
+        data_validation_config = DataValidationConfig(trainingPipelineConfig)
+        data_validation = DataValidation(dataIngestionArtifact, data_validation_config)
+        logger.info("Initiate the data validation")
+        data_validation_artifact = data_validation.initiate_data_validation()
+        logger.info("Data Validation Completed")
+        print(data_validation_artifact)
+
+        data_transformation_config = DataTransformationConfig(trainingPipelineConfig)
+        logger.info("Data Transformation Started")
+        data_transformation = DataTransformation(data_validation_artifact, data_transformation_config)
+        data_transformation_artifact = data_transformation.initiate_data_transformation()
+        print(data_transformation_artifact)
+        logger.info("Data Transformation Completed")
+
+        logger.info("Model Training Started")
+        model_trainer_config = ModelTrainerConfig(trainingPipelineConfig)
+        model_trainer = ModelTrainer(model_trainer_config=model_trainer_config, data_transformation_artifact=data_transformation_artifact)
+        model_trainer_artifact = model_trainer.initiate_model_trainer()
+
+        logger.info("Model Training Artifact created")
+        logger.info("Training pipeline completed successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Training pipeline failed: {str(e)}")
+        raise DeliveryTimeException(e, sys)
 
 def find_latest_artifacts():
     """Find the most recent artifacts directory"""
@@ -80,250 +122,85 @@ def find_latest_artifacts():
         logger.error(f"Error finding artifacts: {e}")
         return None, None
 
-def run_training_pipeline():
-    """Execute the complete training pipeline from main.py with detailed error handling"""
-    error_details = {}
+# Try to use config first, fall back to finding latest artifacts
+try:
+    training_pipeline_config = TrainingPipelineConfig()
+    data_transformation_config = DataTransformationConfig(training_pipeline_config)
+    PIPELINE_PATH = data_transformation_config.transformed_object_file_path
+    MODEL_PATH = "final_model/model.pkl"
     
-    try:
-        logger.info("=== Starting Training Pipeline ===")
-        logger.info(f"Current working directory: {os.getcwd()}")
-        logger.info(f"Python executable: {sys.executable}")
-        
-        # Step 0: Validate config initialization
-        try:
-            logger.info("Step 0: Initializing TrainingPipelineConfig...")
-            trainingPipelineConfig = TrainingPipelineConfig()
-            logger.info(f"✓ TrainingPipelineConfig created: {type(trainingPipelineConfig)}")
-            error_details['config_init'] = 'success'
-        except Exception as e:
-            error_details['config_init'] = f"Failed: {str(e)}"
-            logger.error(f"Config initialization failed: {str(e)}", exc_info=True)
-            raise DeliveryTimeException(f"TrainingPipelineConfig initialization failed: {str(e)}", sys)
-        
-        # Step 1: Data Ingestion
-        try:
-            logger.info("Step 1: Initializing DataIngestionConfig...")
-            dataIngestionConfig = DataIngestionConfig(trainingPipelineConfig)
-            logger.info(f"✓ DataIngestionConfig created")
+    # Check if the config path exists
+    if not os.path.exists(PIPELINE_PATH):
+        logger.warning(f"Config path not found: {PIPELINE_PATH}")
+        logger.info("Attempting to find latest artifacts...")
+        found_pipeline, _ = find_latest_artifacts()
+        if found_pipeline:
+            PIPELINE_PATH = found_pipeline
+            logger.info(f"Using found pipeline: {PIPELINE_PATH}")
             
-            logger.info("Step 1: Creating DataIngestion instance...")
-            data_ingestion = DataIngestion(dataIngestionConfig)
-            logger.info(f"✓ DataIngestion instance created: {type(data_ingestion)}")
-            
-            logger.info("Step 1: Calling initiate_data_ingestion()...")
-            dataIngestionArtifact = data_ingestion.initiate_data_ingestion()
-            logger.info(f"✓ Data Ingestion completed successfully")
-            logger.info(f"DataIngestionArtifact type: {type(dataIngestionArtifact)}")
-            error_details['data_ingestion'] = 'success'
-            print(f"DataIngestionArtifact: {dataIngestionArtifact}")
-            
-        except Exception as e:
-            error_details['data_ingestion'] = f"Failed: {str(e)}"
-            logger.error(f"Data Ingestion failed: {str(e)}", exc_info=True)
-            raise DeliveryTimeException(f"Data ingestion failed: {str(e)}", sys)
-        
-        # Step 2: Data Validation
-        try:
-            logger.info("Step 2: Initializing DataValidationConfig...")
-            data_validation_config = DataValidationConfig(trainingPipelineConfig)
-            logger.info(f"✓ DataValidationConfig created")
-            
-            logger.info("Step 2: Creating DataValidation instance...")
-            data_validation = DataValidation(dataIngestionArtifact, data_validation_config)
-            logger.info(f"✓ DataValidation instance created: {type(data_validation)}")
-            
-            logger.info("Step 2: Calling initiate_data_validation()...")
-            data_validation_artifact = data_validation.initiate_data_validation()
-            logger.info(f"✓ Data Validation completed successfully")
-            logger.info(f"DataValidationArtifact type: {type(data_validation_artifact)}")
-            error_details['data_validation'] = 'success'
-            print(f"DataValidationArtifact: {data_validation_artifact}")
-            
-        except Exception as e:
-            error_details['data_validation'] = f"Failed: {str(e)}"
-            logger.error(f"Data Validation failed: {str(e)}", exc_info=True)
-            raise DeliveryTimeException(f"Data validation failed: {str(e)}", sys)
-        
-        # Step 3: Data Transformation
-        try:
-            logger.info("Step 3: Initializing DataTransformationConfig...")
-            data_transformation_config = DataTransformationConfig(trainingPipelineConfig)
-            logger.info(f"✓ DataTransformationConfig created")
-            
-            logger.info("Step 3: Creating DataTransformation instance...")
-            data_transformation = DataTransformation(data_validation_artifact, data_transformation_config)
-            logger.info(f"✓ DataTransformation instance created: {type(data_transformation)}")
-            
-            logger.info("Step 3: Calling initiate_data_transformation()...")
-            data_transformation_artifact = data_transformation.initiate_data_transformation()
-            logger.info(f"✓ Data Transformation completed successfully")
-            logger.info(f"DataTransformationArtifact type: {type(data_transformation_artifact)}")
-            error_details['data_transformation'] = 'success'
-            print(f"DataTransformationArtifact: {data_transformation_artifact}")
-            
-        except Exception as e:
-            error_details['data_transformation'] = f"Failed: {str(e)}"
-            logger.error(f"Data Transformation failed: {str(e)}", exc_info=True)
-            raise DeliveryTimeException(f"Data transformation failed: {str(e)}", sys)
-        
-        # Step 4: Model Training
-        try:
-            logger.info("Step 4: Initializing ModelTrainerConfig...")
-            model_trainer_config = ModelTrainerConfig(trainingPipelineConfig)
-            logger.info(f"✓ ModelTrainerConfig created")
-            
-            logger.info("Step 4: Creating ModelTrainer instance...")
-            model_trainer = ModelTrainer(
-                model_trainer_config=model_trainer_config, 
-                data_transformation_artifact=data_transformation_artifact
-            )
-            logger.info(f"✓ ModelTrainer instance created: {type(model_trainer)}")
-            
-            logger.info("Step 4: Calling initiate_model_trainer()...")
-            model_trainer_artifact = model_trainer.initiate_model_trainer()
-            logger.info(f"✓ Model Training completed successfully")
-            logger.info(f"ModelTrainerArtifact type: {type(model_trainer_artifact)}")
-            error_details['model_trainer'] = 'success'
-            print(f"ModelTrainerArtifact: {model_trainer_artifact}")
-            
-        except Exception as e:
-            error_details['model_trainer'] = f"Failed: {str(e)}"
-            logger.error(f"Model Training failed: {str(e)}", exc_info=True)
-            raise DeliveryTimeException(f"Model training failed: {str(e)}", sys)
-        
-        logger.info("=== Training Pipeline Completed Successfully ===")
-        logger.info(f"Pipeline execution summary: {error_details}")
-        return True, error_details
-        
-    except Exception as e:
-        logger.error(f"=== Training Pipeline FAILED ===")
-        logger.error(f"Pipeline execution summary: {error_details}")
-        logger.error(f"Final error: {str(e)}", exc_info=True)
-        return False, error_details
+except Exception as e:
+    logger.warning(f"Could not load config: {e}")
+    logger.info("Attempting to find latest artifacts...")
+    PIPELINE_PATH, _ = find_latest_artifacts()
+    MODEL_PATH = "final_model/model.pkl"
 
-def load_model_artifacts():
-    """Load model artifacts after training or on startup"""
-    global PIPELINE_PATH, model_artifacts, is_model_trained
-    
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load or train model artifacts on startup and cleanup on shutdown"""
     try:
-        # Try config path first
-        try:
-            training_pipeline_config = TrainingPipelineConfig()
-            data_transformation_config = DataTransformationConfig(training_pipeline_config)
-            PIPELINE_PATH = data_transformation_config.transformed_object_file_path
-            MODEL_PATH = "final_model/model.pkl"
-            logger.info(f"Using config paths - Pipeline: {PIPELINE_PATH}, Model: {MODEL_PATH}")
-        except Exception as e:
-            logger.warning(f"Config path failed: {e}, falling back to latest artifacts")
-            # Fallback to finding latest artifacts
+        logger.info("Initializing application...")
+        
+        # Check if artifacts exist; if not, run training
+        if not PIPELINE_PATH or not os.path.exists(PIPELINE_PATH) or not os.path.exists(MODEL_PATH):
+            logger.info("Artifacts not found. Running training pipeline...")
+            run_training_pipeline()
+            # After training, re-find artifacts (they should now exist)
             PIPELINE_PATH, _ = find_latest_artifacts()
-            MODEL_PATH = "final_model/model.pkl"
-        
-        # Check if artifacts exist
-        pipeline_exists = PIPELINE_PATH and os.path.exists(PIPELINE_PATH)
-        model_exists = os.path.exists(MODEL_PATH)
-        
-        logger.info(f"Artifact check - Pipeline exists: {pipeline_exists}, Model exists: {model_exists}")
+            if not PIPELINE_PATH:
+                raise FileNotFoundError("Training completed but artifacts not found. Check logs.")
+            logger.info(f"Training generated artifacts. Using pipeline: {PIPELINE_PATH}")
+        else:
+            logger.info("Artifacts found. Skipping training.")
+
         logger.info(f"Pipeline path: {PIPELINE_PATH}")
         logger.info(f"Model path: {MODEL_PATH}")
+
+        if not os.path.exists(PIPELINE_PATH):
+            error_msg = f"Pipeline not found at {PIPELINE_PATH}\n"
+            error_msg += "\nPlease ensure artifacts are available or training succeeds.\n"
+            error_msg += "Training creates the pipeline at: Artifacts/<timestamp>/data_transformation/transformed_object/\n"
+            
+            # List what files exist
+            if PIPELINE_PATH:
+                parent_dir = os.path.dirname(PIPELINE_PATH)
+                if os.path.exists(parent_dir):
+                    files = os.listdir(parent_dir)
+                    error_msg += f"\nFiles found in {parent_dir}:\n"
+                    for f in files:
+                        error_msg += f"  - {f}\n"
+            
+            raise FileNotFoundError(error_msg)
         
-        if not pipeline_exists or not model_exists:
-            logger.warning("Model artifacts not found.")
-            if not pipeline_exists:
-                logger.warning(f"Pipeline file missing: {PIPELINE_PATH}")
-            if not model_exists:
-                logger.warning(f"Model file missing: {MODEL_PATH}")
-            return False
-        
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(f"Model not found at {MODEL_PATH}\n"
+                                   "Ensure model training saves to final_model/model.pkl")
+
         # Load the complete preprocessing pipeline
         logger.info(f"Loading pipeline from: {PIPELINE_PATH}")
         model_artifacts['pipeline'] = joblib.load(PIPELINE_PATH)
-        logger.info(f"✓ Pipeline loaded: {type(model_artifacts['pipeline'])}")
         
         # Load the trained model
         logger.info(f"Loading model from: {MODEL_PATH}")
         model_artifacts['model'] = joblib.load(MODEL_PATH)
-        logger.info(f"✓ Model loaded: {type(model_artifacts['model'])}")
-        
-        is_model_trained = True
+
         logger.info("✓ Model artifacts loaded successfully")
-        return True
         
     except Exception as e:
-        logger.error(f"Failed to load model artifacts: {str(e)}", exc_info=True)
-        logger.error(f"Pipeline path attempted: {PIPELINE_PATH}")
-        logger.error(f"Model path attempted: {MODEL_PATH}")
-        is_model_trained = False
-        return False
+        logger.error(f"Failed to initialize model artifacts: {str(e)}")
+        raise
 
-# Auto-training on startup
-def initialize_model():
-    """Initialize model by checking for existing or training new"""
-    global is_model_trained
-    
-    logger.info("=== Model Initialization Started ===")
-    
-    # First, try to load existing model
-    if load_model_artifacts():
-        logger.info("✓ Existing model loaded on startup")
-        logger.info("=== Model Initialization Completed Successfully ===")
-        return True
-    
-    # If no model exists and auto-training is enabled, train new model
-    if AUTO_TRAIN_ON_STARTUP:
-        logger.info("No existing model found. Starting automatic training...")
-        start_time = datetime.now()
-        
-        success, error_details = run_training_pipeline()
-        end_time = datetime.now()
-        training_duration = (end_time - start_time).total_seconds()
-        
-        if success:
-            logger.info(f"✓ Automatic training completed in {training_duration:.2f} seconds")
-            
-            # Load the newly trained model
-            if load_model_artifacts():
-                logger.info("✓ Newly trained model loaded successfully")
-                logger.info("=== Model Initialization Completed Successfully ===")
-                return True
-            else:
-                logger.error("Training succeeded but model loading failed")
-                logger.error(f"Error details: {error_details}")
-                logger.info("=== Model Initialization FAILED ===")
-                return False
-        else:
-            logger.error(f"Automatic training failed after {training_duration:.2f} seconds")
-            logger.error(f"Error details: {error_details}")
-            logger.info("=== Model Initialization FAILED ===")
-            return False
-    else:
-        logger.warning("Auto-training disabled. Model not available until /train is called")
-        logger.info("=== Model Initialization Skipped (Auto-training disabled) ===")
-        return False
-
-# Initialize model on startup
-if __name__ == "__main__":
-    # Run initialization before starting FastAPI
-    initialize_model()
-elif "PYTEST_CURRENT_TEST" not in os.environ:
-    # For non-test environments, initialize on import
-    initialize_model()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """FastAPI lifespan - model is already loaded during initialization"""
-    logger.info("FastAPI application starting...")
-    
-    # Model is already loaded/initialized at this point
-    if is_model_trained:
-        logger.info(f"✓ Model is ready for inference")
-        logger.info(f"Pipeline type: {type(model_artifacts.get('pipeline', 'None'))}")
-        logger.info(f"Model type: {type(model_artifacts.get('model', 'None'))}")
-    else:
-        logger.warning("⚠️  Model not available - API will require manual training")
-    
     yield
-    
+
     # Cleanup
     logger.info("Shutting down application...")
     model_artifacts.clear()
@@ -344,18 +221,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Training request model
-class TrainingRequest(BaseModel):
-    force_retrain: bool = Field(default=False, description="Force retraining even if model exists")
-
-class TrainingResponse(BaseModel):
-    status: str
-    message: str
-    model_version: str
-    training_duration: float
-    artifacts_path: str
-    pipeline_summary: Dict[str, str]
 
 # Input schema with ORIGINAL feature names
 class DeliveryInput(BaseModel):
@@ -427,101 +292,6 @@ class HealthResponse(BaseModel):
     status: str
     message: str
     model_loaded: bool
-    training_required: bool
-    auto_trained: bool = None
-
-# Training endpoint (for manual retraining) with detailed error reporting
-@app.post("/train", response_model=TrainingResponse, tags=["Training"])
-def train_model(request: TrainingRequest):
-    """Manual model retraining endpoint with detailed error tracking"""
-    global model_artifacts, is_model_trained, PIPELINE_PATH
-    
-    start_time = datetime.now()
-    error_details = {}
-    
-    try:
-        logger.info("=== Manual Training Requested ===")
-        
-        if is_model_trained and not request.force_retrain:
-            # Find the latest artifacts to provide path info
-            current_pipeline, _ = find_latest_artifacts()
-            current_model_path = MODEL_PATH
-            
-            artifacts_path = os.path.dirname(current_pipeline) if current_pipeline else current_model_path
-            
-            return TrainingResponse(
-                status="skipped",
-                message="Model already trained. Use force_retrain=True to retrain.",
-                model_version="1.0.0",
-                training_duration=0.0,
-                artifacts_path=artifacts_path,
-                pipeline_summary={"status": "skipped", "existing_model": True}
-            )
-        
-        logger.info("Clearing existing model state for retraining...")
-        model_artifacts.clear()
-        is_model_trained = False
-        
-        # Run training pipeline with detailed tracking
-        logger.info("Executing training pipeline...")
-        success, pipeline_summary = run_training_pipeline()
-        training_time = (datetime.now() - start_time).total_seconds()
-        
-        if not success:
-            logger.error(f"Training pipeline failed. Summary: {pipeline_summary}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Training pipeline failed. Check logs for details. Pipeline summary: {pipeline_summary}"
-            )
-        
-        logger.info("Training pipeline completed successfully. Loading model artifacts...")
-        
-        # Load the newly trained model
-        load_start_time = datetime.now()
-        if load_model_artifacts():
-            load_duration = (datetime.now() - load_start_time).total_seconds()
-            total_duration = (datetime.now() - start_time).total_seconds()
-            
-            # Get artifacts path
-            try:
-                training_pipeline_config = TrainingPipelineConfig()
-                data_transformation_config = DataTransformationConfig(training_pipeline_config)
-                artifacts_base = os.path.dirname(data_transformation_config.transformed_object_file_path)
-                artifacts_path = os.path.dirname(artifacts_base)
-            except Exception as e:
-                logger.warning(f"Could not determine artifacts path from config: {e}")
-                artifacts_path = os.path.dirname(PIPELINE_PATH) if PIPELINE_PATH else "unknown"
-            
-            logger.info(f"Model loading completed in {load_duration:.2f} seconds")
-            logger.info(f"Total training + loading time: {total_duration:.2f} seconds")
-            
-            return TrainingResponse(
-                status="success",
-                message="Model trained and loaded successfully",
-                model_version="1.0.0",
-                training_duration=total_duration,
-                artifacts_path=artifacts_path,
-                pipeline_summary=pipeline_summary
-            )
-        else:
-            raise HTTPException(
-                status_code=500, 
-                detail="Training succeeded but model loading failed. Check if artifacts were created correctly."
-            )
-            
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"=== Manual Training FAILED ===")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error(f"Error message: {str(e)}", exc_info=True)
-        logger.error(f"Pipeline summary: {error_details}")
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"Training failed with error: {type(e).__name__}: {str(e)}. Check server logs for full traceback."
-        )
 
 @app.get("/", response_model=HealthResponse, tags=["Health"])
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
@@ -536,54 +306,18 @@ def health_check():
     return HealthResponse(
         status="healthy" if model_loaded else "unhealthy",
         message="ETA Prediction API is running" if model_loaded else "Model not loaded",
-        model_loaded=model_loaded,
-        training_required=not is_model_trained,
-        auto_trained=AUTO_TRAIN_ON_STARTUP and is_model_trained
+        model_loaded=model_loaded
     )
-
-@app.get("/diagnostics", tags=["Debug"])
-def get_diagnostics():
-    """Get diagnostic information about the current state"""
-    try:
-        training_pipeline_config = TrainingPipelineConfig()
-        data_transformation_config = DataTransformationConfig(training_pipeline_config)
-        config_pipeline_path = data_transformation_config.transformed_object_file_path
-        
-        latest_pipeline, _ = find_latest_artifacts()
-        
-        return {
-            "is_model_trained": is_model_trained,
-            "model_artifacts_loaded": bool(model_artifacts),
-            "pipeline_path_config": config_pipeline_path,
-            "pipeline_path_latest": latest_pipeline,
-            "model_path": "final_model/model.pkl",
-            "config_exists": os.path.exists(config_pipeline_path),
-            "latest_artifacts_exist": bool(latest_pipeline),
-            "model_file_exists": os.path.exists("final_model/model.pkl"),
-            "artifacts_dir_exists": os.path.exists("Artifacts"),
-            "current_working_dir": os.getcwd(),
-            "python_path": sys.executable,
-            "auto_train_enabled": AUTO_TRAIN_ON_STARTUP
-        }
-    except Exception as e:
-        return {
-            "error": str(e),
-            "is_model_trained": is_model_trained,
-            "model_artifacts_loaded": bool(model_artifacts),
-            "config_load_failed": True
-        }
 
 @app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
 def predict_eta(input_data: DeliveryInput):
-    global model_artifacts, is_model_trained
-    
-    if not is_model_trained or 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model not available. Please call /train endpoint first."
-        )
-
     try:
+        if 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Pipeline or model not loaded"
+            )
+
         input_dict = input_data.model_dump()
         logger.info(f"Prediction request: {input_dict}")
 
@@ -612,12 +346,10 @@ def predict_eta(input_data: DeliveryInput):
 
 @app.post("/predict/batch", tags=["Prediction"])
 def predict_batch(input_data: list[DeliveryInput]):
-    global model_artifacts, is_model_trained
-    
-    if not is_model_trained or 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
-        raise HTTPException(status_code=503, detail="Model not available. Please call /train endpoint first.")
-    
     try:
+        if 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
+            raise HTTPException(status_code=503, detail="Model not loaded")
+        
         predictions = []
         for idx, data in enumerate(input_data):
             input_dict = data.model_dump()
@@ -637,28 +369,15 @@ def predict_batch(input_data: list[DeliveryInput]):
 
 @app.get("/model/info", tags=["Model"])
 def get_model_info():
-    global model_artifacts, is_model_trained
-    
-    if not is_model_trained or 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
-        raise HTTPException(status_code=503, detail="Model not available. Please call /train endpoint first.")
-    
-    try:
-        training_pipeline_config = TrainingPipelineConfig()
-        data_transformation_config = DataTransformationConfig(training_pipeline_config)
-        config_path = data_transformation_config.transformed_object_file_path
-    except:
-        config_path = "Config path unavailable"
+    if 'pipeline' not in model_artifacts or 'model' not in model_artifacts:
+        raise HTTPException(status_code=503, detail="Model not loaded")
     
     return {
         "model_version": "1.0.0",
         "model_type": type(model_artifacts['model']).__name__,
-        "pipeline_type": type(model_artifacts['pipeline']).__name__,
-        "pipeline_path": PIPELINE_PATH or config_path,
-        "model_path": "final_model/model.pkl",
-        "auto_trained": AUTO_TRAIN_ON_STARTUP
+        "pipeline_type": type(model_artifacts['pipeline']).__name__
     }
 
 if __name__ == "__main__":
     import uvicorn
-    import sys
     uvicorn.run(app, host="0.0.0.0", port=8000)
