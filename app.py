@@ -7,7 +7,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, v1
 from contextlib import asynccontextmanager
 from glob import glob
 
@@ -27,6 +27,10 @@ from src.components.data_transformation import DataTransformation
 from src.components.model_trainer import ModelTrainer
 
 import sys
+import warnings
+
+# Suppress Pydantic V2 warning
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic._internal")
 
 # Configure logging
 logging.basicConfig(
@@ -35,8 +39,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variables for model artifacts
+# Global variables for model artifacts and paths - defined at module level
 model_artifacts = {}
+PIPELINE_PATH = None
+MODEL_PATH = None
 
 def run_training_pipeline():
     """Execute the full ML training pipeline from main.py"""
@@ -122,7 +128,8 @@ def find_latest_artifacts():
         logger.error(f"Error finding artifacts: {e}")
         return None, None
 
-# Try to use config first, fall back to finding latest artifacts
+# Initialize paths - try config first, fall back to finding latest artifacts
+logger.info("Initializing configuration and artifact paths...")
 try:
     training_pipeline_config = TrainingPipelineConfig()
     data_transformation_config = DataTransformationConfig(training_pipeline_config)
@@ -137,12 +144,20 @@ try:
         if found_pipeline:
             PIPELINE_PATH = found_pipeline
             logger.info(f"Using found pipeline: {PIPELINE_PATH}")
+        else:
+            PIPELINE_PATH = None
+            logger.warning("No artifacts found via config or search")
             
 except Exception as e:
     logger.warning(f"Could not load config: {e}")
     logger.info("Attempting to find latest artifacts...")
     PIPELINE_PATH, _ = find_latest_artifacts()
     MODEL_PATH = "final_model/model.pkl"
+    if not PIPELINE_PATH:
+        logger.warning("No artifacts found")
+
+logger.info(f"Initialized - PIPELINE_PATH: {PIPELINE_PATH}")
+logger.info(f"Initialized - MODEL_PATH: {MODEL_PATH}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -151,37 +166,49 @@ async def lifespan(app: FastAPI):
         logger.info("Initializing application...")
         
         # Check if artifacts exist; if not, run training
-        if not PIPELINE_PATH or not os.path.exists(PIPELINE_PATH) or not os.path.exists(MODEL_PATH):
+        pipeline_exists = PIPELINE_PATH and os.path.exists(PIPELINE_PATH)
+        model_exists = MODEL_PATH and os.path.exists(MODEL_PATH)
+        
+        if not pipeline_exists or not model_exists:
             logger.info("Artifacts not found. Running training pipeline...")
             run_training_pipeline()
             # After training, re-find artifacts (they should now exist)
-            PIPELINE_PATH, _ = find_latest_artifacts()
-            if not PIPELINE_PATH:
+            found_pipeline, _ = find_latest_artifacts()
+            if found_pipeline:
+                global PIPELINE_PATH
+                PIPELINE_PATH = found_pipeline
+                logger.info(f"Training generated artifacts. Using pipeline: {PIPELINE_PATH}")
+            else:
                 raise FileNotFoundError("Training completed but artifacts not found. Check logs.")
-            logger.info(f"Training generated artifacts. Using pipeline: {PIPELINE_PATH}")
         else:
             logger.info("Artifacts found. Skipping training.")
 
         logger.info(f"Pipeline path: {PIPELINE_PATH}")
         logger.info(f"Model path: {MODEL_PATH}")
 
-        if not os.path.exists(PIPELINE_PATH):
+        if not PIPELINE_PATH or not os.path.exists(PIPELINE_PATH):
             error_msg = f"Pipeline not found at {PIPELINE_PATH}\n"
             error_msg += "\nPlease ensure artifacts are available or training succeeds.\n"
             error_msg += "Training creates the pipeline at: Artifacts/<timestamp>/data_transformation/transformed_object/\n"
             
-            # List what files exist
-            if PIPELINE_PATH:
-                parent_dir = os.path.dirname(PIPELINE_PATH)
-                if os.path.exists(parent_dir):
-                    files = os.listdir(parent_dir)
-                    error_msg += f"\nFiles found in {parent_dir}:\n"
-                    for f in files:
-                        error_msg += f"  - {f}\n"
+            # List what files exist in Artifacts if it exists
+            artifacts_base = "Artifacts"
+            if os.path.exists(artifacts_base):
+                try:
+                    artifact_dirs = os.listdir(artifacts_base)
+                    error_msg += f"\nAvailable artifact directories: {artifact_dirs}\n"
+                    if artifact_dirs:
+                        latest_dir = sorted(artifact_dirs, reverse=True)[0]
+                        pipeline_dir = os.path.join(artifacts_base, latest_dir, "data_transformation", "transformed_object")
+                        if os.path.exists(pipeline_dir):
+                            files = os.listdir(pipeline_dir)
+                            error_msg += f"\nFiles in latest transformed_object directory: {files}\n"
+                except Exception as list_error:
+                    error_msg += f"\nError listing artifacts: {list_error}\n"
             
             raise FileNotFoundError(error_msg)
         
-        if not os.path.exists(MODEL_PATH):
+        if not MODEL_PATH or not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(f"Model not found at {MODEL_PATH}\n"
                                    "Ensure model training saves to final_model/model.pkl")
 
@@ -197,6 +224,8 @@ async def lifespan(app: FastAPI):
         
     except Exception as e:
         logger.error(f"Failed to initialize model artifacts: {str(e)}")
+        logger.error(f"Pipeline path used: {PIPELINE_PATH}")
+        logger.error(f"Model path used: {MODEL_PATH}")
         raise
 
     yield
@@ -222,7 +251,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Input schema with ORIGINAL feature names
+# Input schema with ORIGINAL feature names (using Pydantic V1 compatibility for schema_extra)
 class DeliveryInput(BaseModel):
     Distance_km: float = Field(..., gt=0, example=10.5, description="Distance in kilometers")
     Courier_Experience_yrs: float = Field(..., ge=0, example=2.0, description="Courier experience in years")
@@ -272,7 +301,8 @@ class DeliveryInput(BaseModel):
         return v
     
     class Config:
-        schema_extra = {
+        # Use v1 compatibility for schema_extra
+        json_schema_extra = {
             "example": {
                 "Distance_km": 10.5,
                 "Courier_Experience_yrs": 2.0,
